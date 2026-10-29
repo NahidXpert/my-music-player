@@ -4,7 +4,7 @@ import {
   Home, Library, ListMusic, Menu, Music2, Pause, Pencil, Play, Plus, Repeat,
   Search, Settings, Shuffle, Sparkles, Trash2, Upload, Volume2, X, Zap,
 } from 'lucide-react'
-import { loadState, removePlaylist, removeTrack, savePlaylists, savePreferences, saveTracks } from './lib/db'
+import { loadState, removePlaylist, removeTrack, savePlaylists, savePreferences, saveTrackMetadata, saveTracks, storageErrorMessage } from './lib/db'
 import { isSupportedAudio, readTrack } from './lib/metadata'
 import { formatTime, toneForTrack, type Playlist, type RepeatMode, type Track } from './lib/models'
 import { nextTrack, previousTrack } from './lib/queue'
@@ -124,21 +124,71 @@ export default function App() {
   const historyIndexRef = useRef(0)
   const audioRef = useRef<HTMLAudioElement>(new Audio())
   const objectUrlRef = useRef('')
+  const [ready, setReady] = useState(false)
 
-  useEffect(() => { loadState().then((state) => { setTracks(state.tracks); setPlaylists(state.playlists); setRecentIds(state.recentTrackIds); setVolume(state.volume) }).catch(() => setImportError('Local storage is unavailable. Your library will only last for this session.')) }, [])
-  useEffect(() => { if (tracks.length) saveTracks(tracks).catch(() => setImportError('Could not save library changes locally.')) }, [tracks])
-  useEffect(() => { savePreferences(recentIds, volume).catch(() => undefined) }, [recentIds, volume])
-  useEffect(() => { savePlaylists(playlists).catch(() => undefined) }, [playlists])
+  useEffect(() => {
+    loadState()
+      .then((state) => {
+        setTracks(state.tracks)
+        setPlaylists(state.playlists)
+        setRecentIds(state.recentTrackIds)
+        setVolume(state.volume)
+      })
+      .catch(() => setImportError('Local storage is unavailable. Your library will only last for this session.'))
+      .finally(() => setReady(true))
+  }, [])
+  useEffect(() => { if (!ready) return; saveTrackMetadata(tracks).catch((error) => setImportError(storageErrorMessage(error))) }, [ready, tracks])
+  useEffect(() => { if (!ready) return; savePreferences(recentIds, volume).catch(() => undefined) }, [ready, recentIds, volume])
+  useEffect(() => { if (!ready) return; savePlaylists(playlists).catch(() => undefined) }, [ready, playlists])
   useEffect(() => { const audio = audioRef.current; const update = () => { setProgress(audio.currentTime); setDuration(Number.isFinite(audio.duration) ? audio.duration : current?.duration ?? 0) }; const ended = () => { const following = nextTrack(current?.id, queue.length ? queue : tracks, shuffle, repeat); if (following) play(following); else setIsPlaying(false) }; const failed = () => { setIsPlaying(false); setStatusMessage(`This audio file is unavailable or cannot be decoded: ${current?.fileName ?? 'unknown file'}.`) }; audio.addEventListener('timeupdate', update); audio.addEventListener('loadedmetadata', update); audio.addEventListener('ended', ended); audio.addEventListener('error', failed); return () => { audio.removeEventListener('timeupdate', update); audio.removeEventListener('loadedmetadata', update); audio.removeEventListener('ended', ended); audio.removeEventListener('error', failed) } }, [current?.id, queue, tracks, shuffle, repeat])
   useEffect(() => () => { audioRef.current.pause(); URL.revokeObjectURL(objectUrlRef.current) }, [])
   useEffect(() => { audioRef.current.volume = muted ? 0 : volume }, [volume, muted])
   useEffect(() => { const online = () => setOnline(true); const offline = () => setOnline(false); window.addEventListener('online', online); window.addEventListener('offline', offline); return () => { window.removeEventListener('online', online); window.removeEventListener('offline', offline) } }, [])
-  const play = useCallback((track: Track) => { const audio = audioRef.current; if (objectUrlRef.current) URL.revokeObjectURL(objectUrlRef.current); objectUrlRef.current = URL.createObjectURL(track.file); audio.src = objectUrlRef.current; audio.volume = muted ? 0 : volume; setCurrent(track); setProgress(0); setDuration(track.duration); setIsPlaying(true); audio.play().catch(() => setIsPlaying(false)); setRecentIds((ids) => [track.id, ...ids.filter((id) => id !== track.id)].slice(0, 12)); setTracks((items) => items.map((item) => item.id === track.id ? { ...item, lastPlayedAt: Date.now() } : item)) }, [muted, volume])
+  const play = useCallback((track: Track) => {
+    if (!track.file || track.file.size === 0) {
+      setIsPlaying(false)
+      setStatusMessage(`This audio file is no longer stored locally. Import "${track.fileName}" again to play it.`)
+      return
+    }
+    const audio = audioRef.current
+    if (objectUrlRef.current) URL.revokeObjectURL(objectUrlRef.current)
+    objectUrlRef.current = URL.createObjectURL(track.file)
+    audio.src = objectUrlRef.current
+    audio.volume = muted ? 0 : volume
+    setCurrent(track)
+    setProgress(0)
+    setDuration(track.duration)
+    setIsPlaying(true)
+    audio.play().catch(() => setIsPlaying(false))
+    setRecentIds((ids) => [track.id, ...ids.filter((id) => id !== track.id)].slice(0, 12))
+    setTracks((items) => items.map((item) => item.id === track.id ? { ...item, lastPlayedAt: Date.now() } : item))
+  }, [muted, volume])
   const togglePlay = () => { if (!current) return; if (audioRef.current.paused) { audioRef.current.play().then(() => setIsPlaying(true)).catch(() => setIsPlaying(false)) } else { audioRef.current.pause(); setIsPlaying(false) } }
   const next = () => { const following = nextTrack(current?.id, queue.length ? queue : tracks, shuffle, repeat === 'one' ? 'all' : repeat); if (following) play(following) }
   const previous = () => { const following = previousTrack(current?.id, queue.length ? queue : tracks); if (following) play(following) }
   const toggleFavorite = (id: string) => setTracks((items) => items.map((track) => track.id === id ? { ...track, favorite: !track.favorite } : track))
-  const importFiles = async (files: FileList | File[]) => { setImportError(''); const incoming = Array.from(files); const valid = incoming.filter(isSupportedAudio); if (valid.length !== incoming.length) setImportError('Some files were skipped because they are not supported audio files.'); const existing = new Set(tracks.map((track) => `${track.fileName}:${track.file.size}`)); const nextTracks: Track[] = []; for (const file of valid) { if (existing.has(`${file.name}:${file.size}`)) continue; try { const track = await readTrack(file); nextTracks.push(track) } catch { setImportError((message) => `${message ? `${message} ` : ''}Could not read ${file.name}.`) } } if (nextTracks.length) { setTracks((items) => [...items, ...nextTracks]); await saveTracks(nextTracks); setDialogOpen(false); setView('Library') } }
+  const importFiles = async (files: FileList | File[]) => {
+    setImportError('')
+    const incoming = Array.from(files)
+    const valid = incoming.filter(isSupportedAudio)
+    if (valid.length !== incoming.length) setImportError('Some files were skipped because they are not supported audio files.')
+    const existing = new Set(tracks.map((track) => `${track.fileName}:${track.file.size}`))
+    const nextTracks: Track[] = []
+    for (const file of valid) {
+      if (existing.has(`${file.name}:${file.size}`)) continue
+      try { const track = await readTrack(file); nextTracks.push(track) }
+      catch { setImportError((message) => `${message ? `${message} ` : ''}Could not read ${file.name}.`) }
+    }
+    if (!nextTracks.length) return
+    setTracks((items) => [...items, ...nextTracks])
+    try {
+      await saveTracks(nextTracks)
+      setDialogOpen(false)
+      setView('Library')
+    } catch (error) {
+      setImportError(storageErrorMessage(error))
+    }
+  }
   const remove = async (id: string) => { if (current?.id === id) { audioRef.current.pause(); setCurrent(undefined); setIsPlaying(false) } setTracks((items) => items.filter((track) => track.id !== id)); setQueue((items) => items.filter((track) => track.id !== id)); setRecentIds((ids) => ids.filter((item) => item !== id)); await removeTrack(id).catch(() => setImportError('Could not remove this track from local storage.')) }
   const recent = recentIds.map((id) => tracks.find((track) => track.id === id)).filter((track): track is Track => Boolean(track))
   const navigate = useCallback((nextView: View, nextFilter = '') => {
